@@ -14,7 +14,7 @@ This GitHub Actions workflow automates the process of upgrading an Amazon EKS Ku
 
 Create a file named `config.json` in your repository to store the AMI ID, cluster version, plugin versions, and Launch Template ID:
 
-```json
+json
 {
   "cluster_version": "1.29",
   "ami_id": "ami-12345678",
