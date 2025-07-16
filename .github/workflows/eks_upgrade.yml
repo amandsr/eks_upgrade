@@ -1,0 +1,96 @@
+name: EKS Kubernetes Upgrade, Add-ons Update, and Node AMI Update
+
+on:
+  workflow_dispatch:
+
+jobs:
+  upgrade-kubernetes:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v2
+
+    - name: Set up eksctl
+      run: |
+        curl --silent --location "https://github.com/weaveworks/eksctl/releases/download/v0.135.0/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+        sudo mv /tmp/eksctl /usr/local/bin
+
+    - name: Load Configuration
+      id: load_config
+      run: |
+        CONFIG=$(cat config.json)
+        echo "CLUSTER_VERSION=$(echo $CONFIG | jq -r '.cluster_version')" >> $GITHUB_ENV
+        echo "AMI_ID=$(echo $CONFIG | jq -r '.ami_id')" >> $GITHUB_ENV
+        echo "VPC_CNI_VERSION=$(echo $CONFIG | jq -r '.vpc_cni_version')" >> $GITHUB_ENV
+        echo "KUBE_PROXY_VERSION=$(echo $CONFIG | jq -r '.kube_proxy_version')" >> $GITHUB_ENV
+        echo "LAUNCH_TEMPLATE_ID=$(echo $CONFIG | jq -r '.launch_template_id')" >> $GITHUB_ENV
+
+    - name: Upgrade EKS Cluster
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: us-west-2
+        CLUSTER_VERSION: ${{ env.CLUSTER_VERSION }}
+      run: |
+        eksctl upgrade cluster --name my-cluster --region $AWS_REGION --version $CLUSTER_VERSION
+
+    - name: Validate Upgrade
+      run: |
+        kubectl version --short
+
+    - name: Update Amazon VPC CNI Add-on
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: us-west-2
+        VPC_CNI_VERSION: ${{ env.VPC_CNI_VERSION }}
+      run: |
+        eksctl utils update-cni --cluster my-cluster --region $AWS_REGION --approve --version $VPC_CNI_VERSION
+
+    - name: Update kube-proxy Add-on
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: us-west-2
+        KUBE_PROXY_VERSION: ${{ env.KUBE_PROXY_VERSION }}
+      run: |
+        eksctl utils update-kube-proxy --cluster my-cluster --region $AWS_REGION --approve --version $KUBE_PROXY_VERSION
+
+    - name: Validate Add-ons Update
+      run: |
+        kubectl get deployment -n kube-system
+
+    - name: Update Launch Template
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: us-west-2
+        AMI_ID: ${{ env.AMI_ID }}
+        LAUNCH_TEMPLATE_ID: ${{ env.LAUNCH_TEMPLATE_ID }}
+      run: |
+        aws ec2 create-launch-template-version --launch-template-id $LAUNCH_TEMPLATE_ID --source-version 1 --version-description "Updated AMI" --launch-template-data '{"ImageId":"'"$AMI_ID"'"}'
+
+    - name: Update Auto Scaling Group
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: us-west-2
+        LAUNCH_TEMPLATE_ID: ${{ env.LAUNCH_TEMPLATE_ID }}
+      run: |
+        CURRENT_CAPACITY=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name my-asg --query 'AutoScalingGroups[0].DesiredCapacity' --output text)
+        aws autoscaling update-auto-scaling-group --auto-scaling-group-name my-asg --termination-policies "OldestInstance"
+        for ((i=0; i<$CURRENT_CAPACITY; i++))
+        do
+          NEW_CAPACITY=$((CURRENT_CAPACITY - 1))
+          aws autoscaling set-desired-capacity --auto-scaling-group-name my-asg --desired-capacity $NEW_CAPACITY
+          sleep 300
+          NEW_INSTANCE_ID=$(aws autoscaling describe-auto-scaling-instances --query 'AutoScalingInstances[?AutoScalingGroupName==`my-asg`].InstanceId' --output text | tail -n 1)
+          NEW_AMI_ID=$(aws ec2 describe-instances --instance-ids $NEW_INSTANCE_ID --query 'Reservations[0].Instances[0].ImageId' --output text)
+          if [ "$NEW_AMI_ID" != "$AMI_ID" ]; then
+            echo "Instance validation failed. Expected AMI: $AMI_ID, Found AMI: $NEW_AMI_ID"
+            exit 1
+          fi
+          CURRENT_CAPACITY=$((NEW_CAPACITY + 1))
+          aws autoscaling set-desired-capacity --auto-scaling-group-name my-asg --desired-capacity $CURRENT_CAPACITY
+        done

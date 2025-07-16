@@ -1,0 +1,7 @@
+{
+  "cluster_version": "1.29",
+  "ami_id": "ami-12345678",
+  "vpc_cni_version": "latest",
+  "kube_proxy_version": "latest",
+  "launch_template_id": "lt-0abcd1234efgh5678"
+}
